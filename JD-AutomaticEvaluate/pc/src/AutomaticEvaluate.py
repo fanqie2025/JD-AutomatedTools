@@ -46,6 +46,10 @@ class AutomaticEvaluate(object):
 	CURRENT_AI_GROUP: str = ""                   	# AI模型的组别名称 | 使用AI模型生成评论文案
 	CURRENT_AI_MODEL: str = ""                   	# AI模型的名称 | 使用AI模型生成评论文案
 	LOG_LEVEL: str = "INFO"                         # 日志记录等级
+	MAX_TASKS: int = 0                              # [ADD 2026-09-22 WorkBuddy] 最多处理多少个商品评价任务；0 = 不限。试跑时设 1 可只跑第一件商品
+	MAX_PAGES: int = 20                             # [FIX 2026-09-22 WorkBuddy] 待评价列表页最多翻多少页，防止「结束标志失效」时死循环
+	WHITELIST: list = []                            # [FIX 2026-09-22 WorkBuddy] 只处理这些订单（按 订单编号 或 orderVoucher url 匹配）；留空 = 不限制
+	BLACKLIST: list = []                            # [FIX 2026-09-22 WorkBuddy] 跳过这些订单；留空 = 不限制
 
 	def __init__(self) -> None:
 		self.__page, browser = None, None
@@ -73,17 +77,39 @@ class AutomaticEvaluate(object):
 		auto_settings.add_argument('-cac', '--close-auto-commit', action='store_true', default=False, dest="close_auto_commit", help="关闭自动提交 | 启用此设置，在自动填充完评价页面后将不会自动点击提交按钮")
 		auto_settings.add_argument('-dtv', '--deal-turing-verification', type=int, choices=[0, 1], default=0, dest="deal_turing_verification", help="图灵测试的处理| 0触发测试直接退出，1阻塞等待手动处理")
 		auto_settings.add_argument('-gc', '--guarantee-commit', action='store_true', default=False, dest="guarantee_commit", help="保底评价 | 在获取不到已有信息时使用文本默认评价并提交")
+		# [ADD 2026-09-22 WorkBuddy] 白/黑名单，便于「只试跑某一单」或跳过个别订单。留空不传 = 全部处理。
+		auto_settings.add_argument('-wl', '--whitelist', type=str, nargs='+', default=None, dest="whitelist", help="白名单 | 只处理这些订单编号（可多个，空格分隔）")
+		auto_settings.add_argument('-bl', '--blacklist', type=str, nargs='+', default=None, dest="blacklist", help="黑名单 | 跳过这些订单编号（可多个，空格分隔）")
+		auto_settings.add_argument('-mt', '--max-tasks', type=int, default=None, dest="max_tasks", help="最多处理多少个商品评价任务(0=不限) | 试跑建议设 1")
 
 		ai_settings = parser.add_argument_group(title="AI设置", description="-g 与 -m 需同时设置;")
 		ai_settings.add_argument('-g', '--ai-group', type=str, default=None, dest="ai_group", help="AI模型的组别名称 | 使用AI模型生成评论文案")
 		ai_settings.add_argument('-m', '--ai-model', type=str, default=None, dest="ai_model", help="AI模型的名称 | 使用AI模型生成评论文案")
 		args = parser.parse_args()  # 解析命令行参数
 
+		# [FIX 2026-09-22 WorkBuddy] 原实现是「dest 名直接转大写作类属性名」，但
+		# -md/-mi/-mc/-g/-m 的 dest（min_descriptions / min_images / min_charcount /
+		# ai_group / ai_model）与真实类属性名对不上：
+		#     MIN_EXISTING_PRODUCT_DESCRIPTIONS / MIN_EXISTING_PRODUCT_IMAGES /
+		#     MIN_DESCRIPTION_CHAR_COUNT     / CURRENT_AI_GROUP / CURRENT_AI_MODEL
+		# 结果这些命令行参数全部静默失效（只在终端打一行「未知参数错误」，不报错），
+		# 包括最关键的 -g/-m —— 也就是说命令行走 AI 生成文案从来就没生效过。
+		# 故加一张别名映射表。
+		ALIASES = {
+			"min_descriptions": "MIN_EXISTING_PRODUCT_DESCRIPTIONS",
+			"min_images": "MIN_EXISTING_PRODUCT_IMAGES",
+			"min_charcount": "MIN_DESCRIPTION_CHAR_COUNT",
+			"ai_group": "CURRENT_AI_GROUP",
+			"ai_model": "CURRENT_AI_MODEL",
+		}
 		# 直接使用 dest 参数的全大写形式更新类属性
 		for key, value in vars(args).items():
-			if value is not None and hasattr(cls, key.upper()):
-				setattr(cls, key.upper(), value)
-			elif not hasattr(cls, key.upper()):
+			if key == "supported_table":  # -T 由自定义 Action 自行处理，不映射到类属性
+				continue
+			attr = ALIASES.get(key, key.upper())
+			if value is not None and hasattr(cls, attr):
+				setattr(cls, attr, value)
+			elif not hasattr(cls, attr):
 				print(f"未知参数错误：{key}")
 		return cls
 
@@ -97,7 +123,14 @@ class AutomaticEvaluate(object):
 			self.__page, _ = logInWithCookies()
 			self.__init_image_directory(TEMP_IMAGE_DIR)
 
+			# [ADD 2026-09-22 WorkBuddy] 风控规避：多单之间留随机间隔，避免机械连续作业
+			_task_no = 0
 			for task in self.__generate_task():
+				if _task_no > 0:
+					_pause = random.randint(15, 45)
+					LOG.info(f"多单间隔：休息 {_pause} 秒（降低风控概率）")
+					self.__page.wait_for_timeout(_pause * 1000)
+				_task_no += 1
 				LOG.debug(f"任务已生成：{task}")
 				self.__automatic_evaluate(task)
 			return True
@@ -123,7 +156,9 @@ class AutomaticEvaluate(object):
 		创建任务，获取 `orderVoucher_url`
 		"""
 		page = 1 # 起始页
-		while True:
+		# [FIX 2026-09-22 WorkBuddy] 原为 `while True`，仅靠 .tip-icon 兜底。
+		# 一旦京东不再渲染 .tip-icon，就会无限翻页空转。加页数上限。
+		while page <= self.MAX_PAGES:
 			url_1 = f'https://club.jd.com/myJdcomments/myJdcomment.action?sort=0&page={page}' # 待评价订单页面
 			try:
 				# 等待结束标志
@@ -139,6 +174,11 @@ class AutomaticEvaluate(object):
 				raise NetworkError(message=f"页面加载超时：{url_1}")
 
 			btn_elements: list = self.__page.locator('.btn-def').element_handles()
+			# [FIX 2026-09-22 WorkBuddy] 本页没有「评价」按钮 = 没有待评价订单，直接结束。
+			# 避免 .tip-icon 失效时翻到空页仍继续。
+			if not btn_elements:
+				LOG.info(f'第 {page} 页未发现待评价订单，任务收集结束！')
+				break
 			for btn_element in btn_elements:
 				parent_element = btn_element.evaluate_handle("el => el.closest('.operate')")
 				# 检查父级元素中是否包含提示“请在手机客户端查看订单详情”
@@ -150,6 +190,13 @@ class AutomaticEvaluate(object):
 				except Exception as e:
 					LOG.debug(f"检查提示信息时出错: {e}")
 				orderVoucher_url: str = 'https:' + btn_element.get_attribute('href')
+				# [FIX 2026-09-22 WorkBuddy] 白/黑名单在收集阶段就生效，避免为了过滤 1 单
+				# 还要把 20 个评价页全打开一遍。京东列表页的 ruleid 即「订单编号」，
+				# 所以用订单编号当关键词即可命中。
+				if self.WHITELIST and not any(k in orderVoucher_url for k in self.WHITELIST):
+					continue
+				if self.BLACKLIST and any(k in orderVoucher_url for k in self.BLACKLIST):
+					continue
 				task = EvaluationTask()
 				task.orderVoucher_url = orderVoucher_url
 				# LOG.debug(f"{task}")
@@ -167,8 +214,11 @@ class AutomaticEvaluate(object):
 			except PlaywrightTimeoutError:
 				raise NetworkError(message=f"页面加载超时：{task.orderVoucher_url}")
 
-			self.__page.wait_for_timeout(timeout=2000)  # 等待元素加载
-			order_id_element = self.__page.wait_for_selector('//*[@id="o-info-orderinfo"]/div/div/span[1]/a', timeout=3000)
+			# [FIX 2026-09-22 WorkBuddy] 原为 wait_for_timeout(2000) + timeout=3000。
+			# 实测京东评价页首屏渲染要 5s+，9-15 日志正是崩在这一句
+			# （Page.wait_for_selector: Timeout 3000ms exceeded）。
+			self.__page.wait_for_timeout(timeout=4000)  # 等待元素加载
+			order_id_element = self.__page.wait_for_selector('//*[@id="o-info-orderinfo"]/div/div/span[1]/a', timeout=15000)
 			order_id = order_id_element.inner_text()  # 评价页面的订单编号
 			task.order_id = order_id
 
@@ -214,8 +264,12 @@ class AutomaticEvaluate(object):
 				raise NetworkError(message=f"页面加载超时：{task.productHtml_url}")
 
 			version = None
+			# [FIX 2026-09-22] 商详页评价区是异步渲染的，原 2000ms 太短。
+			# 再放宽到 8000ms：对照实验发现「先稳定等 10s 再点全部评价」才稳定点开弹层，
+			# 只等 3s 时点击会被吞掉（2026-09-22 21:29 Edge 试跑实测）。
+			self.__page.wait_for_timeout(timeout=8000)
 			try:
-				if self.__page.wait_for_selector('.all-btn', timeout=2000):
+				if self.__page.wait_for_selector('.all-btn', timeout=15000):
 					version = 2024
 			except PlaywrightTimeoutError:
 				# 目前来看JD国际等商品使用的是2014的界面，直接简单粗暴匹配两个关键元素
@@ -273,18 +327,28 @@ class AutomaticEvaluate(object):
 
 	def __generate_task(self):
 		self.__step_1()
+		# [ADD 2026-09-22 WorkBuddy] 任务数上限，便于试跑（MAX_TASKS=1 只跑第一件商品）
+		_yielded = 0
 
 		for child_task_list in self.__step_2():
 			for child_task in child_task_list:
 				LOG.info("正在生成任务......")
-				blacklist = []
-				whitelist = []
-				if whitelist and child_task.order_id not in whitelist: # 白名单
+				# [FIX 2026-09-22 WorkBuddy] 原代码把白/黑名单写成局部空列表，永远不生效（死代码）。
+				# 改为读取类属性 WHITELIST / BLACKLIST，支持按「订单编号」或 orderVoucher url 匹配。
+				# 两者默认留空 → 行为与原版完全一致（不限制）。
+				blacklist = self.BLACKLIST or []
+				whitelist = self.WHITELIST or []
+				_key = f"{child_task.order_id}|{child_task.orderVoucher_url}"
+				if whitelist and not any(k in _key for k in whitelist): # 白名单
 					continue
-				if blacklist and child_task.order_id in blacklist: # 黑名单
+				if blacklist and any(k in _key for k in blacklist): # 黑名单
 					continue
 				task = self.__step_3(child_task)
+				_yielded += 1
 				yield task
+				if self.MAX_TASKS and _yielded >= self.MAX_TASKS:
+					LOG.info(f"已达到 MAX_TASKS={self.MAX_TASKS} 上限，任务生成提前结束。")
+					return
 
 	@staticmethod
 	def is_bmp_compliant(text: str):
@@ -388,46 +452,103 @@ class AutomaticEvaluate(object):
 		从网页上获取已有的评价文本，无限滚动版
 		"""
 		# 点击 “全部评价”
+		# [FIX 2026-09-22 WorkBuddy] 原为 wait_for_selector(timeout=2000) 后直接 click。
+		# 实测：该按钮位于页面下方，未滚入视口就点会落空；点击后评价弹层
+		# （#rateList → virtuoso-item-list）需数秒渲染。9-15 日志里的
+		# "'全部评价'点击失败!" 与 "相关商品没有评价！" 均源于此。
 		try:
-			all_btn_element = self.__page.wait_for_selector('.all-btn', timeout=2000)
+			all_btn_element = self.__page.wait_for_selector('.all-btn', timeout=15000)
+			all_btn_element.scroll_into_view_if_needed()
+			self.__page.wait_for_timeout(timeout=800)
 			all_btn_element.click()
-			self.__page.wait_for_timeout(timeout=1000) # 等待元素加载
+			# [FIX 2026-09-22 WorkBuddy] 关键门闸：先等虚拟列表容器真的挂载出来，再进抓取循环。
+			# 实测（决定性验证报告）：点击后 T+2s 只渲染 3 条，容器要 ~5-9s 才稳定；
+			# 若不等这一步而直接把「首条渲染时间」摊进循环，3s 超时会导致 0 条（已实测复现）。
+			#
+			# [FIX 2026-09-22 第二轮] 增加「点击被吞」与「风控」的区分：
+			#   · #rateList 不存在 → 点击没生效 → 允许再点一次
+			#   · #rateList 已存在但 virtuoso 迟迟不来 → 接口被卡（风控），再点只会更糟，立即报明
+			self.__page.wait_for_timeout(timeout=3000)
+			opened = False
+			for _try in range(2):
+				try:
+					self.__page.wait_for_selector('div[data-testid="virtuoso-item-list"]', timeout=15000)
+					opened = True
+					break
+				except PlaywrightTimeoutError:
+					if self.__page.locator('#rateList').count() > 0:
+						LOG.critical("评价弹层已打开但一条数据都没有 —— 疑似被风控"
+									 "（弹层内若显示「页面正在维修中」即为风控，停手等几小时）")
+						break
+					LOG.warning(f"第 {_try + 1} 次点击未生效，重试点击『全部评价』")
+					try:
+						all_btn_element.scroll_into_view_if_needed()
+						self.__page.wait_for_timeout(timeout=600)
+						all_btn_element.click()
+						self.__page.wait_for_timeout(timeout=2500)
+					except Exception:
+						pass
+			if opened:
+				self.__page.wait_for_timeout(timeout=2000) # 让虚拟列表完成首次铺开
+			else:
+				LOG.critical("'全部评价'点击失败!")
 		except PlaywrightTimeoutError:
 			LOG.critical("'全部评价'点击失败!")
 
-		try:
-			# 点击 “只看当前商品”
-			if self.CLOSE_SELECT_CURRENT_PRODUCT is False:
-				current_radio_element = self.__page.wait_for_selector('.all-btn', timeout=2000)
-				current_radio_element.click()
-			self.__page.wait_for_timeout(timeout=1000) # 等待动态加载
-		except PlaywrightTimeoutError:
-			self.__requires_TuringVerification()
+		# [FIX 2026-09-22 WorkBuddy] 原代码此处注释写“只看当前商品”，选择器却再次
+		# 写成 `.all-btn`（与上一段完全重复），是明显的复制笔误 —— 它会把刚展开的
+		# 评价弹层再点一次，很可能直接把弹层关掉。实测弹层内也没有“只看当前商品”
+		# 单选项，故停用该分支。
+		# try:
+		# 	if self.CLOSE_SELECT_CURRENT_PRODUCT is False:
+		# 		current_radio_element = self.__page.wait_for_selector('#comm-curr-sku', timeout=3000)
+		# 		current_radio_element.click()
+		# 	self.__page.wait_for_timeout(timeout=1000) # 等待动态加载
+		# except PlaywrightTimeoutError:
+		# 	self.__requires_TuringVerification()
 
 		# 包含评价内容的 div 在滚动时动态刷新，且每次刷新数量较少，可看做逐个刷新；每次获取一个评论元素
 		text_group = []
 		max_scrolls = 60  # 预设滚动次数，等价于抓取的评论元素个数
+		miss = 0
 		for item_index in range(max_scrolls): # data-item-index 从 0 开始
-			try:
-				# 获取当前索引的元素
-				item = self.__page.wait_for_selector(f'div[data-testid="virtuoso-item-list"] > div[data-item-index="{item_index}"]', state="visible", timeout=2000)
-			except PlaywrightTimeoutError:
-				LOG.info("相关商品没有评价！")
-				break
-			# 索引超出，即获取完全部元素
-			if not item:
-				LOG.info(f"已经滚动到最后一个元素! 需求个数: {max_scrolls} ,实际个数: {item_index + 1}")
-				break
+			# [FIX 2026-09-22 WorkBuddy] 原为单次 wait(timeout=2000)，一超时就
+			# LOG.info("相关商品没有评价！") 并 break —— 把“加载慢”误报成“没评价”。
+			# 实测该弹层需滚动才会继续渲染后续索引，故改为重试 + 滚动催促。
+			item = None
+			for attempt in range(3):
+				try:
+					# [FIX 2026-09-22 WorkBuddy] 实测校准：3000ms 太短（会 0 条），
+					# 8000ms 偏慢。6000ms + 3 次重试 + 滚轮催促 是稳妥区间。
+					item = self.__page.wait_for_selector(f'div[data-testid="virtuoso-item-list"] > div[data-item-index="{item_index}"]', state="visible", timeout=6000)
+					break
+				except PlaywrightTimeoutError:
+					self.__page.mouse.wheel(0, 900)   # 滚动催促虚拟列表渲染
+					self.__page.wait_for_timeout(timeout=800)
+			if item is None:
+				miss += 1
+				if miss >= 4:
+					LOG.info(f"连续 4 个索引取不到，判定已到末尾（本次已收集 {len(text_group)} 条）")
+					break
+				continue
+			miss = 0
+			if item_index % 10 == 0:
+				LOG.debug(f"文案抓取进度: 索引 {item_index}, 已收集 {len(text_group)} 条")
 			# 向下滚动，将元素平滑滚动到视图中；对 item 元素进行滚动时需要其可见
-			self.__page.evaluate("element => element.scrollIntoView({behavior: 'smooth', block: 'center'})", item)
+			try:
+				self.__page.evaluate("element => element.scrollIntoView({behavior: 'smooth', block: 'center'})", item)
+				self.__page.wait_for_timeout(timeout=300)
+			except Exception:
+				pass
 			# 获取评价文本
 			try:
-				text_element = item.wait_for_selector('.jdc-pc-rate-card-main-desc', state="visible", timeout=3000)
+				text_element = item.wait_for_selector('.jdc-pc-rate-card-main-desc', state="visible", timeout=5000)
 				text = text_element.inner_text() # 获取元素属内容前，需等待其可见
 				if text:
 					text_group.append(text)
 			except Exception as err:
 				LOG.debug(".jdc-pc-rate-card-main-desc 获取文本失败")
+		LOG.info(f"评价文案采集完成，共 {len(text_group)} 条")
 
 		# 随机筛选出一条评价
 		try:
@@ -609,39 +730,87 @@ class AutomaticEvaluate(object):
 			image_files_path(list): 储存到本地的(image目录下)隶属一个订单编号下的所有图片文件路径。
 		"""
 		# 点击 “全部评价”
+		# [FIX 2026-09-22 WorkBuddy] 同 __get_text_infinite_scroll_version：
+		# 原 2000ms 超时 + 未滚入视口即点击，必然失败。
 		try:
-			all_btn_element = self.__page.wait_for_selector('.all-btn', timeout=2000)
+			all_btn_element = self.__page.wait_for_selector('.all-btn', timeout=15000)
+			all_btn_element.scroll_into_view_if_needed()
+			# [FIX 2026-09-22] 这里是重新 goto 商品页后的第一次点击，页面刚加载完，
+			# 停留时间需要比文案版更长（800ms → 3000ms），否则点击会被吞掉。
+			self.__page.wait_for_timeout(timeout=3000)
 			all_btn_element.click()
-			self.__page.wait_for_timeout(timeout=1000)
+			# [FIX 2026-09-22 WorkBuddy] 同文案版：等虚拟列表容器挂载 + 区分「点击被吞」与「风控」
+			self.__page.wait_for_timeout(timeout=3000)
+			opened = False
+			for _try in range(2):
+				try:
+					self.__page.wait_for_selector('div[data-testid="virtuoso-item-list"]', timeout=15000)
+					opened = True
+					break
+				except PlaywrightTimeoutError:
+					if self.__page.locator('#rateList').count() > 0:
+						LOG.critical("评价弹层已打开但一条数据都没有 —— 疑似被风控，停手等几小时")
+						break
+					LOG.warning(f"第 {_try + 1} 次点击未生效，重试点击『全部评价』")
+					try:
+						all_btn_element.scroll_into_view_if_needed()
+						self.__page.wait_for_timeout(timeout=600)
+						all_btn_element.click()
+						self.__page.wait_for_timeout(timeout=2500)
+					except Exception:
+						pass
+			if opened:
+				self.__page.wait_for_timeout(timeout=2000)
+			else:
+				LOG.critical("'全部评价'点击失败!")
+				self.__requires_TuringVerification()
 		except PlaywrightTimeoutError:
 			LOG.critical("'全部评价'点击失败!")
 			self.__requires_TuringVerification()
 
-		# 点击 “只看当前商品”
-		try:
-			if self.CLOSE_SELECT_CURRENT_PRODUCT is False:
-				current_radio_element = self.__page.wait_for_selector('.all-btn', timeout=2000)
-				current_radio_element.click()
-			self.__page.wait_for_timeout(timeout=1000) # 等待动态加载
-		except PlaywrightTimeoutError:
-			self.__requires_TuringVerification()
+		# [FIX 2026-09-22 WorkBuddy] 同 text 版：此处选择器写成 `.all-btn` 是复制笔误，
+		# 会把刚展开的评价弹层再点一次。停用。
+		# try:
+		# 	if self.CLOSE_SELECT_CURRENT_PRODUCT is False:
+		# 		current_radio_element = self.__page.wait_for_selector('#comm-curr-sku', timeout=3000)
+		# 		current_radio_element.click()
+		# 	self.__page.wait_for_timeout(timeout=1000) # 等待动态加载
+		# except PlaywrightTimeoutError:
+		# 	self.__requires_TuringVerification()
 
 		# 包含评价内容的 div 在滚动时动态刷新，且每次刷新数量较少，可看做逐个刷新；每次获取一个评论元素
 		image_url_group: list[list] = []
 		max_scrolls = 100  # 预设滚动次数，等价于抓取的评论元素个数
+		miss = 0
 		for item_index in range(max_scrolls): # data-item-index 从 0 开始
-			try:
-				# 获取当前索引的元素
-				item = self.__page.wait_for_selector(f'div[data-testid="virtuoso-item-list"] > div[data-item-index="{item_index}"]', state="visible", timeout=2000)
-			except PlaywrightTimeoutError:
-				LOG.info("相关商品没有评价！")
-				break
-			# 索引超出，即获取完全部元素
-			if not item:
-				LOG.info(f"已经滚动到最后一个元素! 需求个数: {max_scrolls} ,实际个数: {item_index + 1}")
-				break
+			# [FIX 2026-09-22 WorkBuddy] 同 text 版：原单次 2000ms 超时即 break，
+			# 把“加载慢”误报成“相关商品没有评价”。改为重试 + 滚动催促。
+			item = None
+			for attempt in range(3):
+				try:
+					# [FIX 2026-09-22 WorkBuddy] 同文案版，校准为 6000ms + 重试 + 滚轮催促
+					item = self.__page.wait_for_selector(f'div[data-testid="virtuoso-item-list"] > div[data-item-index="{item_index}"]', state="visible", timeout=6000)
+					break
+				except PlaywrightTimeoutError:
+					self.__page.mouse.wheel(0, 900)
+					self.__page.wait_for_timeout(timeout=800)
+			if item is None:
+				miss += 1
+				if miss >= 4:
+					LOG.info(f"连续 4 个索引取不到，判定已到末尾（本次已收集图片组 {len(image_url_group)} 组）")
+					break
+				continue
+			miss = 0
+			if item_index % 5 == 0:
+				LOG.info(f"图片抓取进度: 索引 {item_index}, 已收集图片组 {len(image_url_group)} 组")
 			# 向下滚动，将元素平滑滚动到视图中；对 item 元素进行滚动时需要其可见
-			self.__page.evaluate("element => element.scrollIntoView({behavior: 'smooth', block: 'center'})", item)
+			try:
+				self.__page.evaluate("element => element.scrollIntoView({behavior: 'smooth', block: 'center'})", item)
+			except Exception:
+				pass
+			# [ADD 2026-09-22 WorkBuddy] 风控规避：加点「人的节奏」。
+			# 实测教训——固定节拍的机械操作是触发京东评价区风控的主因。
+			self.__page.wait_for_timeout(timeout=random.randint(300, 1100))
 			# 获取图片 url
 			image_url_list = []
 			image_items = item.query_selector_all('.jd-content-pc-media-list-item') # 一个评论内的全部图片元素，视频与图片都需要点击此元素打开预览元素。其子元素当出现视频时不可点击
@@ -649,6 +818,8 @@ class AutomaticEvaluate(object):
 				self.__page.wait_for_timeout(timeout=200) # 等待滚动完成；由于使用的 JS 滚动操作时异步的，不能单使用 playwright 判断元素是否稳定来确定滚动是否完成；仅为了视觉效果，不影响下面的内容获取
 				item.wait_for_element_state(state="stable", timeout=2000) # 有图片元素，需等待页面元素稳定
 				for image_item in image_items:
+					# [ADD 2026-09-22 WorkBuddy] 逐张开预览是最像脚本的动作，插入随机停顿
+					self.__page.wait_for_timeout(timeout=random.randint(400, 1500))
 					image_item.click() # 点击后会出现更大的图片预览元素
 					try:
 						preview_image_element = self.__page.wait_for_selector('.jdc-pc-media-preview-image', state="visible", timeout=2000) # 等待预览图可见
@@ -670,13 +841,20 @@ class AutomaticEvaluate(object):
 					try:
 						preview_close_element = self.__page.wait_for_selector('.jdc-pc-media-preview-close', timeout=2000)
 						preview_close_element.click()
+						# [ADD 2026-09-22 WorkBuddy] 关上预览再喘一口，别连点
+						self.__page.wait_for_timeout(timeout=random.randint(300, 900))
 					except PlaywrightTimeoutError as err:
 						LOG.error("预览图关闭失败！")
 						self.__requires_TuringVerification()
 			if image_url_list:
 				image_url_group.append(image_url_list)
-			if len(image_url_group) >= max(20, self.MIN_EXISTING_PRODUCT_IMAGES): # 评论图片充足，仅取部分; 最差情况，每组一张图也可满足 MIN_EXISTING_PRODUCT_IMAGES
+			# [FIX 2026-09-22 WorkBuddy] 原为 max(20, MIN_EXISTING_PRODUCT_IMAGES)，
+			# 导致 -mi 参数在最常见区间（<20）完全无效，抓图阶段被迫至少跑满 20 组。
+			# 改为直接尊重 -mi：想快就调小，想图多就调大。默认 15 与原版接近。
+			if len(image_url_group) >= self.MIN_EXISTING_PRODUCT_IMAGES: # 评论图片充足，仅取部分; 最差情况，每组一张图也可满足 MIN_EXISTING_PRODUCT_IMAGES
 				break
+		LOG.info(f"图片抓取结束，共收集 {len(image_url_group)} 组、"
+				 f"{sum(len(g) for g in image_url_group)} 张图")
 		return self.download_image_group(self.get_random_image_group(image_url_group))
 
 	def __automatic_evaluate(self, task: EvaluationTask):
@@ -687,9 +865,39 @@ class AutomaticEvaluate(object):
 			raise NetworkError(message=f"页面加载超时：{task.orderVoucher_url}")
 
 		# 商品评价文本
+		# [FIX 2026-09-22 WorkBuddy] 原用绝对 XPath
+		# `/html/body/div[4]/div/div/div[2]/div[1]/div[7]/div[2]/div[2]/div[2]/div[1]/textarea`，
+		# 页面结构一动就废；且 3000ms 超时对首屏渲染太短（9-15 日志多次报此错）。
+		# 实测评价页共有 4 个 textarea：第 1 个 placeholder 为「完善服务…」（服务评价），
+		# 其余是各商品的评价框，统一被 `.f-textarea` 包裹。改为相对选择器 + 跳过服务框 +
+		# 跳过已有内容的框（保证多商品订单逐个填、不重复评同一个）。
 		try:
-			text_input_element = self.__page.wait_for_selector('xpath=/html/body/div[4]/div/div/div[2]/div[1]/div[7]/div[2]/div[2]/div[2]/div[1]/textarea', timeout=3000)
-			text_input_element.fill(task.input_text)
+			self.__page.wait_for_timeout(timeout=3000)  # 等首屏渲染
+			boxes = self.__page.locator('.f-textarea textarea')
+			count = boxes.count()
+			if count == 0:
+				boxes = self.__page.locator('textarea')
+				count = boxes.count()
+			LOG.debug(f"评价页 textarea 数量: {count}")
+			filled = False
+			for i in range(count):
+				box = boxes.nth(i)
+				try:
+					ph = box.get_attribute('placeholder') or ''
+					if '服务' in ph:
+						continue  # 服务评价框，不填
+					if not box.is_visible():
+						continue
+					if (box.input_value() or '').strip():
+						continue  # 已有内容（已评价），跳过
+					box.click()
+					box.fill(task.input_text)
+					filled = True
+					break
+				except Exception as err:
+					LOG.debug(f"第 {i} 个输入框填充失败: {err}")
+			if not filled:
+				raise PlaywrightTimeoutError(message="未找到可填写的商品评价输入框")
 		except PlaywrightTimeoutError:
 			LOG.error("超时，未识别到评价文本输入框！")
 			return False
@@ -720,7 +928,8 @@ class AutomaticEvaluate(object):
 
 
 		try:
-			file_input_element = self.__page.wait_for_selector('xpath=//input[@type="file"]', timeout=2000) # 查找隐藏的文件上传输入框
+			# [FIX 2026-09-22] 2000ms → 15000ms
+			file_input_element = self.__page.wait_for_selector('xpath=//input[@type="file"]', timeout=15000) # 查找隐藏的文件上传输入框
 			# 商品评价图片
 			if file_input_element and not task.input_image and self.GUARANTEE_COMMIT is False:
 				LOG.warning(f'单号{task.order_id}的订单未上传评价图片，跳过该任务。')
@@ -736,7 +945,8 @@ class AutomaticEvaluate(object):
 		# 提交评价
 		self.__page.wait_for_timeout(timeout=max(5, len(task.input_image) * 2.5) * 1000) # 等待图片上传完成
 		try:
-			btn_submit = self.__page.wait_for_selector('.btn-submit', timeout=2000)
+			# [FIX 2026-09-22] 2000ms → 15000ms
+			btn_submit = self.__page.wait_for_selector('.btn-submit', timeout=15000)
 			btn_submit.hover()
 			if self.CLOSE_AUTO_COMMIT is False:
 				btn_submit.click()

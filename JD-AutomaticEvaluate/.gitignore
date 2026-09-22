@@ -8,3 +8,24 @@ resources/
 commit.bat
 cookies.json
 authenticate.py
+
+# ===== WorkBuddy 2026-09-22 追加：安全底线 =====
+# 这些东西一旦推到公开仓库会造成实际损害，务必保持被忽略。
+#
+#   文件/目录            泄露后果
+#   pc/cookies/          京东账号登录态 —— 拿到就能登你的号
+#   .env                 讯飞星火 AppID / APIKey / Secret
+#   pc/edge-profile/     浏览器 profile，含登录态，体积也大
+#   pc/logs/             日志内含订单编号 / 商品名 / 真实评价内容
+
+pc/cookies/
+pc/edge-profile/
+pc/logs/
+pc/temp/
+_diagnose/
+.env
+.env.*
+*.log
+*.bak
+__pycache__/
+*.pyc

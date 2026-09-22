@@ -25,9 +25,21 @@ import hashlib
 import requests
 import datetime
 import threading
-import websocket  # 使用 websocket_client
+# [FIX 2026-09-22 WorkBuddy] 同 dotenv：websocket-client 只在「用讯飞星火生成文案」时需要。
+# 不改评价文案生成方式（默认抓取已有真实评价）就完全用不到它，因此降为可选导入，
+# 避免顶层 ImportError 把整个工具卡死。
+try:
+    import websocket  # 使用 websocket_client
+except ImportError:
+    websocket = None
 from loguru import logger
-from dotenv import load_dotenv
+# [FIX 2026-09-22 WorkBuddy] 改为可选导入：不使用 AI 生成文案时无需安装 python-dotenv，
+# 否则顶层 ImportError 会让整个工具直接跑不起来。
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
 from abc import ABC, abstractmethod
 from urllib.parse import urlparse, urlencode
 from wsgiref.handlers import format_date_time
@@ -126,7 +138,9 @@ class _WebSocketClient(ABC):
     """
     def __init__(self, ws_url):
         self.ws_url = ws_url
-        self.ws: websocket.WebSocketApp = None
+        # [FIX 2026-09-22 WorkBuddy] 原为 `self.ws: websocket.WebSocketApp = None`。
+        # 变量注解在 Python 中会实际求值，websocket 缺失时这里会抛 AttributeError。
+        self.ws = None
         self.is_open_event = threading.Event()  # 用事件标志状态
         self.message_queue = queue.Queue()  # 用于存储服务器发送的消息
 
